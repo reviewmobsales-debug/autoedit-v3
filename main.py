@@ -21,6 +21,7 @@ from pathlib import Path
 from editor.effects import get_duration, remove_silences
 from editor.captions import burn_captions_from_whisper
 from editor.transcription import transcribe_video
+from burn_overlay import burn_text_overlay
 
 
 app = Flask(__name__, static_folder=None)
