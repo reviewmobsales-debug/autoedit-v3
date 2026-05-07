@@ -16,7 +16,12 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from face_crop import auto_crop_vertical
+
+# Modular imports
+from editor.effects import get_duration, remove_silences
+from editor.captions import burn_captions_from_whisper
+from editor.transcription import transcribe_video
+
 
 app = Flask(__name__, static_folder=None)
 BASE = Path(__file__).parent.resolve()
@@ -217,81 +222,7 @@ def retry_ffmpeg(cmd, max_retries=2, timeout=120):
             return False
     return False
 
-def get_duration(path):
-    r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
-                        "-of","default=noprint_wrappers=1:nokey=1", str(path)],
-                       capture_output=True, text=True, timeout=10)
-    try: return float(r.stdout.strip())
-    except: return 0.0
 
-def remove_silences(input_path, output_path, threshold="-40dB", min_duration=0.3):
-    """Remove silent/dead-air segments using ffmpeg concat demuxer."""
-    import re, tempfile, json
-    
-    # Step 1: Detect silence periods
-    detect = subprocess.run([
-        "ffmpeg","-y","-i",str(input_path),"-af",
-        f"silencedetect=noise={threshold}:d={min_duration}",
-        "-f","null","-"
-    ], capture_output=True, text=True, timeout=30)
-    
-    starts = re.findall(r'silence_start:\s*([\d\.]+)', detect.stderr)
-    ends   = re.findall(r'silence_end:\s*([\d\.]+)',   detect.stderr)
-    silence = [(float(s), float(e)) for s, e in zip(starts, ends)]
-    
-    if not silence:
-        subprocess.run(["ffmpeg","-y","-i",str(input_path),"-c","copy",str(output_path)],
-                     capture_output=True, timeout=30)
-        return True
-    
-    # Step 2: Build non-silent segments
-    total = get_duration(input_path)
-    segments = []
-    cursor = 0.0
-    for s_start, s_end in silence:
-        if s_start - cursor >= 0.1:
-            segments.append((cursor, s_start))
-        cursor = s_end
-    if total - cursor >= 0.1:
-        segments.append((cursor, total))
-    
-    # Step 3: Extract clips and concat
-    tmpdir = tempfile.mkdtemp(prefix="silentrm_")
-    clips = []
-    for i, (seg_start, seg_end) in enumerate(segments):
-        clip = f"{tmpdir}/clip_{i:04d}.mp4"
-        r = subprocess.run([
-            "ffmpeg","-y","-i",str(input_path),"-ss",str(seg_start),
-            "-t",str(seg_end - seg_start),"-c","copy","-avoid_negative_ts","make_zero",
-            clip
-        ], capture_output=True, timeout=60)
-        if r.returncode == 0 and os.path.exists(clip) and os.path.getsize(clip) > 1000:
-            clips.append(clip)
-    
-    if not clips:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        return False
-    
-    # Step 4: Concat
-    listfile = f"{tmpdir}/list.txt"
-    with open(listfile, "w") as f:
-        for c in clips:
-            f.write(f"file '{c}'\n")
-    
-    r = subprocess.run([
-        "ffmpeg","-y","-f","concat","-safe","0","-i",listfile,
-        "-c","copy","-movflags","+faststart", str(output_path)
-    ], capture_output=True, timeout=120)
-    
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    return r.returncode == 0 and os.path.exists(output_path)
-
-
-# ════════════════════════════════════════════════════════════════
-#  PROGRESS TRACKING
-# ════════════════════════════════════════════════════════════════
-
-PROGRESS_FILE = BASE / "progress.json"
 
 def get_progress(job_id):
     """Get current job progress from file."""
@@ -351,146 +282,9 @@ def crop_vertical():
             "duration": round(dur, 2),
             "message": "Auto-cropped to vertical 9:16 with face detection"
         })
-    return _err("face crop failed")
-
-
-def transcribe_video(video_path, model="base"):
-    """Real Whisper transcription with word-level timing."""
-    import whisper
-    
-    wmodel = whisper.load_model(model)
-    result = wmodel.transcribe(str(video_path), word_timestamps=True)
-    
-    segments = []
-    for seg in result["segments"]:
-        segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"].strip(),
-            "words": seg.get("words", [])
-        })
     return segments, result["text"]
 
 
-def burn_captions_from_whisper(input_path, output_path, segments, style="tiktok"):
-    """Burn real Whisper captions with TikTok-style glow effects using PIL."""
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
-    
-    # Extract frames
-    frames_dir = tempfile.mkdtemp(prefix="frames_")
-    subprocess.run([
-        "ffmpeg","-y","-i",str(input_path),
-        "-vf","fps=30,scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black",
-        "-pix_fmt","rgb24", f"{frames_dir}/frame_%05d.png"
-    ], capture_output=True, timeout=120)
-    
-    frames = sorted([f for f in os.listdir(frames_dir) if f.endswith('.png')])
-    if not frames:
-        subprocess.run(["ffmpeg","-y","-i",str(input_path),"-c","copy",str(output_path)], capture_output=True, timeout=30)
-        return False
-    
-    fps = 30.0
-    frame_dur = 1.0 / fps
-    
-    # Font settings per style
-    font_path = "/System/Library/Fonts/Helvetica.ttc"
-    font_large = ImageFont.truetype(font_path, 80)
-    font_medium = ImageFont.truetype(font_path, 56)
-    font_small = ImageFont.truetype(font_path, 40)
-    
-    text_lines = [seg["text"] for seg in segments[:4]]
-    if not text_lines:
-        text_lines = ["AutoEdit", "AI Captions", "Ready!"]
-    
-    for idx, frame_file in enumerate(frames):
-        frame_time = idx * frame_dur + (frame_dur / 2)
-        img = Image.open(f"{frames_dir}/{frame_file}")
-        draw = ImageDraw.Draw(img, "RGBA")
-        w, h = img.size
-        
-        # Find active text at this timestamp
-        active_text = ""
-        for seg in segments:
-            if seg["start"] <= frame_time <= seg["end"]:
-                active_text = seg["text"]
-                break
-        
-        if active_text:
-            if style == "tiktok":
-                # TikTok: Large centered text with glow + rounded box
-                y_pos = int(h * 0.75)
-                font = font_large
-                
-                # Measure text
-                bbox = draw.textbbox((0, 0), active_text, font=font)
-                tw = bbox[2] - bbox[0]
-                th = bbox[3] - bbox[1]
-                x_pos = (w - tw) // 2
-                
-                # Glow effect (multiple blurred outlines)
-                glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-                gdraw = ImageDraw.Draw(glow)
-                for dx, dy in [(i, j) for i in range(-6, 7, 2) for j in range(-6, 7, 2)]:
-                    gdraw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(255, 50, 150, 30))
-                glow = glow.filter(ImageFilter.GaussianBlur(radius=4))
-                img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
-                draw = ImageDraw.Draw(img, "RGBA")
-                
-                # Background capsule
-                padding_x = 30
-                padding_y = 16
-                draw.rounded_rectangle(
-                    [x_pos - padding_x, y_pos - padding_y, x_pos + tw + padding_x, y_pos + th + padding_y],
-                    radius=20, fill=(0, 0, 0, 150)
-                )
-                
-                # Bold outline
-                for dx, dy in [(-4,-4),(-4,4),(4,-4),(4,4),(0,-4),(0,4),(-4,0),(4,0)]:
-                    draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(0, 0, 0, 200))
-                
-                # White text
-                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
-                
-            elif style == "youtube":
-                # YouTube: Bottom-left aligned, smaller, box
-                y_pos = int(h * 0.88)
-                font = font_medium
-                bbox = draw.textbbox((0, 0), active_text, font=font)
-                tw = bbox[2] - bbox[0]
-                x_pos = max(30, (w - tw) // 2)
-                
-                draw.rectangle([x_pos - 16, y_pos - 12, x_pos + tw + 16, y_pos + 40 + 12],
-                               fill=(0, 0, 0, 180))
-                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
-                
-            else:  # clean
-                y_pos = int(h * 0.85)
-                font = font_small
-                bbox = draw.textbbox((0, 0), active_text, font=font)
-                tw = bbox[2] - bbox[0]
-                x_pos = (w - tw) // 2
-                
-                # Subtle outline
-                for dx, dy in [(-2,-2),(-2,2),(2,-2),(2,2)]:
-                    draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(0, 0, 0, 100))
-                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
-        
-        # Add watermark: "AutoEdit" top-right
-        wm_text = "AutoEdit"
-        draw.text((w - 140, 20), wm_text, font=font_small, fill=(255, 255, 255, 180))
-        
-        img.save(f"{frames_dir}/{frame_file}")
-    
-    # Reconstruct
-    subprocess.run([
-        "ffmpeg","-y","-framerate","30","-i",f"{frames_dir}/frame_%05d.png",
-        "-i",str(input_path),"-map","0:v","-map","1:a",
-        "-c:v","libx264","-preset","fast","-crf","23",
-        "-c:a","copy","-pix_fmt","yuv420p","-shortest", str(output_path)
-    ], capture_output=True, timeout=120)
-    
-    shutil.rmtree(frames_dir, ignore_errors=True)
-    return os.path.exists(output_path)
 
 def edit_video():
     data = request.get_json(force=True) or {}
