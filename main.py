@@ -203,13 +203,66 @@ def get_duration(path):
     except: return 0.0
 
 def remove_silences(input_path, output_path, threshold="-40dB", min_duration=0.3):
-    """Remove silent/dead-air segments. -shortest ensures video matches trimmed audio length."""
-    r = subprocess.run([
+    """Remove silent/dead-air segments using ffmpeg concat demuxer."""
+    import re, tempfile, json
+    
+    # Step 1: Detect silence periods
+    detect = subprocess.run([
         "ffmpeg","-y","-i",str(input_path),"-af",
-        f"silenceremove=stop_periods=-1:stop_duration={min_duration}:stop_threshold={threshold}",
-        "-c:v","copy","-c:a","aac","-b:a","128k","-shortest", str(output_path)
-    ], capture_output=True, timeout=60)
-    return r.returncode == 0
+        f"silencedetect=noise={threshold}:d={min_duration}",
+        "-f","null","-"
+    ], capture_output=True, text=True, timeout=30)
+    
+    starts = re.findall(r'silence_start:\s*([\d\.]+)', detect.stderr)
+    ends   = re.findall(r'silence_end:\s*([\d\.]+)',   detect.stderr)
+    silence = [(float(s), float(e)) for s, e in zip(starts, ends)]
+    
+    if not silence:
+        subprocess.run(["ffmpeg","-y","-i",str(input_path),"-c","copy",str(output_path)],
+                     capture_output=True, timeout=30)
+        return True
+    
+    # Step 2: Build non-silent segments
+    total = get_duration(input_path)
+    segments = []
+    cursor = 0.0
+    for s_start, s_end in silence:
+        if s_start - cursor >= 0.1:
+            segments.append((cursor, s_start))
+        cursor = s_end
+    if total - cursor >= 0.1:
+        segments.append((cursor, total))
+    
+    # Step 3: Extract clips and concat
+    tmpdir = tempfile.mkdtemp(prefix="silentrm_")
+    clips = []
+    for i, (seg_start, seg_end) in enumerate(segments):
+        clip = f"{tmpdir}/clip_{i:04d}.mp4"
+        r = subprocess.run([
+            "ffmpeg","-y","-i",str(input_path),"-ss",str(seg_start),
+            "-t",str(seg_end - seg_start),"-c","copy","-avoid_negative_ts","make_zero",
+            clip
+        ], capture_output=True, timeout=60)
+        if r.returncode == 0 and os.path.exists(clip) and os.path.getsize(clip) > 1000:
+            clips.append(clip)
+    
+    if not clips:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return False
+    
+    # Step 4: Concat
+    listfile = f"{tmpdir}/list.txt"
+    with open(listfile, "w") as f:
+        for c in clips:
+            f.write(f"file '{c}'\n")
+    
+    r = subprocess.run([
+        "ffmpeg","-y","-f","concat","-safe","0","-i",listfile,
+        "-c","copy","-movflags","+faststart", str(output_path)
+    ], capture_output=True, timeout=120)
+    
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    return r.returncode == 0 and os.path.exists(output_path)
 
 def transcribe_video(video_path, model="base"):
     """Real Whisper transcription with word-level timing."""
@@ -372,7 +425,7 @@ def edit_video():
     current = Path(path)
     if remove_sil:
         ok = remove_silences(current, temp)
-        if ok and temp.exists() and get_duration(temp) < get_duration(current):
+        if ok and temp.exists():
             current = temp
             # Recalculate original duration based on trimmed audio
             original_dur = get_duration(current)
