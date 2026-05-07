@@ -337,6 +337,53 @@ def edit_video():
         "captionsApplied": auto_caps,
     })
 
+
+@app.route("/api/analyze", methods=["POST"])
+def analyze_video_endpoint():
+    """Upload and analyze video orientation/format."""
+    vid = request.files.get("file")
+    if not vid or vid.filename == "":
+        return _err("no file")
+    
+    import tempfile, subprocess, json
+    fd, temp_path = tempfile.mkstemp(suffix=".mp4")
+    os.close(fd)
+    vid.save(temp_path)
+    
+    # Analyze
+    r = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,duration",
+        "-of", "json", temp_path
+    ], capture_output=True, text=True, timeout=10)
+    
+    os.remove(temp_path)
+    
+    try:
+        data = json.loads(r.stdout)
+        s = data.get("streams", [{}])[0]
+        w, h = s.get("width", 0), s.get("height", 0)
+        dur = float(s.get("duration", 0))
+        aspect = w / h if h else 0
+        
+        if aspect < 0.8:
+            orient, best_for = "VERTICAL", ["TikTok", "Reels", "Shorts"]
+            style = "tiktok"
+        elif aspect > 1.5:
+            orient, best_for = "HORIZONTAL", ["YouTube", "Landscape"]
+            style = "youtube"
+        else:
+            orient, best_for = "SQUARE", ["Instagram", "Facebook"]
+            style = "clean"
+        
+        return _ok({
+            "width": w, "height": h, "aspect_ratio": round(aspect, 2),
+            "duration": round(dur, 1), "orientation": orient,
+            "best_for": best_for, "suggested_style": style
+        })
+    except Exception as e:
+        return _err(f"analyze error: {e}")
+
 @app.route("/api/download")
 def download():
     path = request.args.get("path", "")
