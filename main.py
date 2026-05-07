@@ -195,6 +195,27 @@ def upload():
 #  EDIT ENGINE
 # ════════════════════════════════════════════════════════════════
 
+
+# ════════════════════════════════════════════════════════════════
+#  RETRY WRAPPER
+# ════════════════════════════════════════════════════════════════
+
+def retry_ffmpeg(cmd, max_retries=2, timeout=120):
+    """Run ffmpeg command with auto-retry on failure."""
+    for attempt in range(max_retries):
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        if r.returncode == 0:
+            return True
+        err = r.stderr.decode('utf-8', errors='ignore') if r.stderr else ""
+        if "Cannot allocate memory" in err or "Resource temporarily unavailable" in err:
+            print(f"ffmpeg attempt {attempt+1}/{max_retries} failed, retrying...")
+            time.sleep(0.5 * (attempt + 1))
+        else:
+            # Real error, log and fail
+            print(f"ffmpeg failed: {err[:200]}")
+            return False
+    return False
+
 def get_duration(path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
                         "-of","default=noprint_wrappers=1:nokey=1", str(path)],
@@ -264,6 +285,52 @@ def remove_silences(input_path, output_path, threshold="-40dB", min_duration=0.3
     shutil.rmtree(tmpdir, ignore_errors=True)
     return r.returncode == 0 and os.path.exists(output_path)
 
+
+# ════════════════════════════════════════════════════════════════
+#  PROGRESS TRACKING
+# ════════════════════════════════════════════════════════════════
+
+PROGRESS_FILE = BASE / "progress.json"
+
+def get_progress(job_id):
+    """Get current job progress from file."""
+    if PROGRESS_FILE.exists():
+        try:
+            import json
+            with open(PROGRESS_FILE) as f:
+                data = json.load(f)
+                return data.get(job_id, {})
+        except:
+            pass
+    return {}
+
+def set_progress(job_id, phase, percent, detail=""):
+    """Update job progress in file."""
+    import json
+    data = {}
+    if PROGRESS_FILE.exists():
+        try:
+            with open(PROGRESS_FILE) as f:
+                data = json.load(f)
+        except:
+            pass
+    data[job_id] = {
+        "phase": phase,
+        "percent": percent,
+        "detail": detail,
+        "timestamp": time.time()
+    }
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(data, f)
+
+@app.route("/api/progress/<job_id>")
+def get_progress_route(job_id):
+    """Pollable progress endpoint."""
+    prog = get_progress(job_id)
+    if prog:
+        return _ok(prog)
+    return _err("job not found")
+
 def transcribe_video(video_path, model="base"):
     """Real Whisper transcription with word-level timing."""
     import whisper
@@ -281,11 +348,12 @@ def transcribe_video(video_path, model="base"):
         })
     return segments, result["text"]
 
+
 def burn_captions_from_whisper(input_path, output_path, segments, style="tiktok"):
-    """Burn real Whisper captions with word-level timing using PIL."""
-    from PIL import Image, ImageDraw, ImageFont
+    """Burn real Whisper captions with TikTok-style glow effects using PIL."""
+    from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
     
-    # Extract frames from video
+    # Extract frames
     frames_dir = tempfile.mkdtemp(prefix="frames_")
     subprocess.run([
         "ffmpeg","-y","-i",str(input_path),
@@ -298,116 +366,109 @@ def burn_captions_from_whisper(input_path, output_path, segments, style="tiktok"
         subprocess.run(["ffmpeg","-y","-i",str(input_path),"-c","copy",str(output_path)], capture_output=True, timeout=30)
         return False
     
-    # Calculate frame timestamps
     fps = 30.0
-    frame_duration = 1.0 / fps
-    total_duration = len(frames) * frame_duration
+    frame_dur = 1.0 / fps
     
-    # Font
+    # Font settings per style
     font_path = "/System/Library/Fonts/Helvetica.ttc"
-    try:
-        if style == "tiktok":
-            font = ImageFont.truetype(font_path, 72)
-            font_small = ImageFont.truetype(font_path, 48)
-        elif style == "youtube":
-            font = ImageFont.truetype(font_path, 56)
-            font_small = ImageFont.truetype(font_path, 36)
-        else:
-            font = ImageFont.truetype(font_path, 48)
-            font_small = ImageFont.truetype(font_path, 32)
-    except:
-        font = ImageFont.load_default()
-        font_small = font
+    font_large = ImageFont.truetype(font_path, 80)
+    font_medium = ImageFont.truetype(font_path, 56)
+    font_small = ImageFont.truetype(font_path, 40)
     
-    # For each frame, find the active word/segment
+    text_lines = [seg["text"] for seg in segments[:4]]
+    if not text_lines:
+        text_lines = ["AutoEdit", "AI Captions", "Ready!"]
+    
     for idx, frame_file in enumerate(frames):
-        frame_time = idx * frame_duration + (frame_duration / 2)  # Middle of frame
-        
+        frame_time = idx * frame_dur + (frame_dur / 2)
         img = Image.open(f"{frames_dir}/{frame_file}")
         draw = ImageDraw.Draw(img, "RGBA")
         w, h = img.size
         
-        # Find what text should be displayed at this timestamp
+        # Find active text at this timestamp
         active_text = ""
         for seg in segments:
             if seg["start"] <= frame_time <= seg["end"]:
-                # Highlight current word
-                words = seg.get("words", [])
-                if words:
-                    for word_info in words:
-                        if word_info["start"] <= frame_time <= word_info["end"]:
-                            active_text = word_info["word"].strip()
-                            break
-                    if not active_text:
-                        # Show full segment text
-                        active_text = seg["text"]
-                else:
-                    active_text = seg["text"]
+                active_text = seg["text"]
                 break
         
         if active_text:
-            # Style-specific positioning
             if style == "tiktok":
-                y_pos = h * 0.75
-                box_color = (0, 0, 0, 160)
-                outline_color = (0, 0, 0, 200)
-                text_color = (255, 255, 255)
-                outline_width = 4
-            elif style == "youtube":
-                y_pos = h * 0.88
-                box_color = (0, 0, 0, 180)
-                outline_color = (0, 0, 0, 150)
-                text_color = (255, 255, 255)
-                outline_width = 3
-            else:  # clean
-                y_pos = h * 0.85
-                box_color = None
-                outline_color = (0, 0, 0, 150)
-                text_color = (255, 255, 255)
-                outline_width = 2
-            
-            # Measure text
-            bbox = draw.textbbox((0, 0), active_text, font=font)
-            text_w = bbox[2] - bbox[0]
-            text_h = bbox[3] - bbox[1]
-            
-            x_pos = (w - text_w) / 2
-            
-            # Background box for tiktok/youtube
-            if box_color and style in ("tiktok", "youtube"):
-                padding = 20
+                # TikTok: Large centered text with glow + rounded box
+                y_pos = int(h * 0.75)
+                font = font_large
+                
+                # Measure text
+                bbox = draw.textbbox((0, 0), active_text, font=font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                x_pos = (w - tw) // 2
+                
+                # Glow effect (multiple blurred outlines)
+                glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                gdraw = ImageDraw.Draw(glow)
+                for dx, dy in [(i, j) for i in range(-6, 7, 2) for j in range(-6, 7, 2)]:
+                    gdraw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(255, 50, 150, 30))
+                glow = glow.filter(ImageFilter.GaussianBlur(radius=4))
+                img = Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB")
+                draw = ImageDraw.Draw(img, "RGBA")
+                
+                # Background capsule
+                padding_x = 30
+                padding_y = 16
                 draw.rounded_rectangle(
-                    [x_pos - padding, y_pos - padding, 
-                     x_pos + text_w + padding, y_pos + text_h + padding],
-                    radius=12, fill=box_color
+                    [x_pos - padding_x, y_pos - padding_y, x_pos + tw + padding_x, y_pos + th + padding_y],
+                    radius=20, fill=(0, 0, 0, 150)
                 )
-            
-            # Outline
-            for dx, dy in [(-outline_width, -outline_width), (-outline_width, outline_width),
-                           (outline_width, -outline_width), (outline_width, outline_width),
-                           (0, -outline_width), (0, outline_width),
-                           (-outline_width, 0), (outline_width, 0)]:
-                draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=outline_color)
-            
-            # Main text
-            draw.text((x_pos, y_pos), active_text, font=font, fill=text_color)
+                
+                # Bold outline
+                for dx, dy in [(-4,-4),(-4,4),(4,-4),(4,4),(0,-4),(0,4),(-4,0),(4,0)]:
+                    draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(0, 0, 0, 200))
+                
+                # White text
+                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
+                
+            elif style == "youtube":
+                # YouTube: Bottom-left aligned, smaller, box
+                y_pos = int(h * 0.88)
+                font = font_medium
+                bbox = draw.textbbox((0, 0), active_text, font=font)
+                tw = bbox[2] - bbox[0]
+                x_pos = max(30, (w - tw) // 2)
+                
+                draw.rectangle([x_pos - 16, y_pos - 12, x_pos + tw + 16, y_pos + 40 + 12],
+                               fill=(0, 0, 0, 180))
+                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
+                
+            else:  # clean
+                y_pos = int(h * 0.85)
+                font = font_small
+                bbox = draw.textbbox((0, 0), active_text, font=font)
+                tw = bbox[2] - bbox[0]
+                x_pos = (w - tw) // 2
+                
+                # Subtle outline
+                for dx, dy in [(-2,-2),(-2,2),(2,-2),(2,2)]:
+                    draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=(0, 0, 0, 100))
+                draw.text((x_pos, y_pos), active_text, font=font, fill=(255, 255, 255))
+        
+        # Add watermark: "AutoEdit" top-right
+        wm_text = "AutoEdit"
+        draw.text((w - 140, 20), wm_text, font=font_small, fill=(255, 255, 255, 180))
         
         img.save(f"{frames_dir}/{frame_file}")
     
-    # Reconstruct video
+    # Reconstruct
     subprocess.run([
         "ffmpeg","-y","-framerate","30","-i",f"{frames_dir}/frame_%05d.png",
-        "-i",str(input_path),"-map","0:v","-map","1:a","-c:v","libx264","-preset","fast","-crf","23",
+        "-i",str(input_path),"-map","0:v","-map","1:a",
+        "-c:v","libx264","-preset","fast","-crf","23",
         "-c:a","copy","-pix_fmt","yuv420p","-shortest", str(output_path)
     ], capture_output=True, timeout=120)
     
-    # Cleanup
-    import shutil
     shutil.rmtree(frames_dir, ignore_errors=True)
-    
     return os.path.exists(output_path)
 
-@app.route("/api/edit", methods=["POST"])
 def edit_video():
     data = request.get_json(force=True) or {}
     path = data.get("path", "")
