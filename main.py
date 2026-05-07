@@ -202,18 +202,35 @@ def get_duration(path):
     try: return float(r.stdout.strip())
     except: return 0.0
 
-def remove_silences(input_path, output_path, threshold="-50dB", min_duration=0.5):
+def remove_silences(input_path, output_path, threshold="-40dB", min_duration=0.3):
+    """Remove silent/dead-air segments. -shortest ensures video matches trimmed audio length."""
     r = subprocess.run([
         "ffmpeg","-y","-i",str(input_path),"-af",
-        f"silenceremove=stop_periods=1:stop_duration={min_duration}:stop_threshold={threshold}",
-        "-c:v","copy","-c:a","aac","-b:a","128k", str(output_path)
+        f"silenceremove=stop_periods=-1:stop_duration={min_duration}:stop_threshold={threshold}",
+        "-c:v","copy","-c:a","aac","-b:a","128k","-shortest", str(output_path)
     ], capture_output=True, timeout=60)
     return r.returncode == 0
 
-def burn_captions(input_path, output_path, style="tiktok"):
-    """Burn captions using PIL (reliable on all systems)"""
+def transcribe_video(video_path, model="base"):
+    """Real Whisper transcription with word-level timing."""
+    import whisper
+    
+    wmodel = whisper.load_model(model)
+    result = wmodel.transcribe(str(video_path), word_timestamps=True)
+    
+    segments = []
+    for seg in result["segments"]:
+        segments.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"].strip(),
+            "words": seg.get("words", [])
+        })
+    return segments, result["text"]
+
+def burn_captions_from_whisper(input_path, output_path, segments, style="tiktok"):
+    """Burn real Whisper captions with word-level timing using PIL."""
     from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
     
     # Extract frames from video
     frames_dir = tempfile.mkdtemp(prefix="frames_")
@@ -228,35 +245,99 @@ def burn_captions(input_path, output_path, style="tiktok"):
         subprocess.run(["ffmpeg","-y","-i",str(input_path),"-c","copy",str(output_path)], capture_output=True, timeout=30)
         return False
     
+    # Calculate frame timestamps
+    fps = 30.0
+    frame_duration = 1.0 / fps
+    total_duration = len(frames) * frame_duration
+    
     # Font
     font_path = "/System/Library/Fonts/Helvetica.ttc"
     try:
-        font = ImageFont.truetype(font_path, 60)
-        font_small = ImageFont.truetype(font_path, 40)
+        if style == "tiktok":
+            font = ImageFont.truetype(font_path, 72)
+            font_small = ImageFont.truetype(font_path, 48)
+        elif style == "youtube":
+            font = ImageFont.truetype(font_path, 56)
+            font_small = ImageFont.truetype(font_path, 36)
+        else:
+            font = ImageFont.truetype(font_path, 48)
+            font_small = ImageFont.truetype(font_path, 32)
     except:
         font = ImageFont.load_default()
         font_small = font
     
-    # Caption text
-    text_lines = ["AutoEdit v3", "WORKING! 🎉", "Drag & Drop", "→ Done ✓"]
-    
+    # For each frame, find the active word/segment
     for idx, frame_file in enumerate(frames):
+        frame_time = idx * frame_duration + (frame_duration / 2)  # Middle of frame
+        
         img = Image.open(f"{frames_dir}/{frame_file}")
         draw = ImageDraw.Draw(img, "RGBA")
         w, h = img.size
         
-        # Calculate which lines to show based on time
-        lines_to_show = text_lines[:min((idx // (len(frames)//4)) + 1, len(text_lines))]
+        # Find what text should be displayed at this timestamp
+        active_text = ""
+        for seg in segments:
+            if seg["start"] <= frame_time <= seg["end"]:
+                # Highlight current word
+                words = seg.get("words", [])
+                if words:
+                    for word_info in words:
+                        if word_info["start"] <= frame_time <= word_info["end"]:
+                            active_text = word_info["word"].strip()
+                            break
+                    if not active_text:
+                        # Show full segment text
+                        active_text = seg["text"]
+                else:
+                    active_text = seg["text"]
+                break
         
-        y_start = h * 0.65
-        for i, line in enumerate(lines_to_show):
-            y = y_start + i * 75
-            # Draw text with outline
-            for dx, dy in [(-3,-3),(-3,3),(3,-3),(3,3),(-2,-2),(-2,2),(2,-2),(2,2)]:
-                draw.text((w/2 + dx, y + dy), line, font=font, fill=(0,0,0,180), anchor="mm")
+        if active_text:
+            # Style-specific positioning
+            if style == "tiktok":
+                y_pos = h * 0.75
+                box_color = (0, 0, 0, 160)
+                outline_color = (0, 0, 0, 200)
+                text_color = (255, 255, 255)
+                outline_width = 4
+            elif style == "youtube":
+                y_pos = h * 0.88
+                box_color = (0, 0, 0, 180)
+                outline_color = (0, 0, 0, 150)
+                text_color = (255, 255, 255)
+                outline_width = 3
+            else:  # clean
+                y_pos = h * 0.85
+                box_color = None
+                outline_color = (0, 0, 0, 150)
+                text_color = (255, 255, 255)
+                outline_width = 2
+            
+            # Measure text
+            bbox = draw.textbbox((0, 0), active_text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            
+            x_pos = (w - text_w) / 2
+            
+            # Background box for tiktok/youtube
+            if box_color and style in ("tiktok", "youtube"):
+                padding = 20
+                draw.rounded_rectangle(
+                    [x_pos - padding, y_pos - padding, 
+                     x_pos + text_w + padding, y_pos + text_h + padding],
+                    radius=12, fill=box_color
+                )
+            
+            # Outline
+            for dx, dy in [(-outline_width, -outline_width), (-outline_width, outline_width),
+                           (outline_width, -outline_width), (outline_width, outline_width),
+                           (0, -outline_width), (0, outline_width),
+                           (-outline_width, 0), (outline_width, 0)]:
+                draw.text((x_pos + dx, y_pos + dy), active_text, font=font, fill=outline_color)
+            
             # Main text
-            color = (255,255,255) if style != "tiktok" else (255,255,255)
-            draw.text((w/2, y), line, font=font, fill=color, anchor="mm")
+            draw.text((x_pos, y_pos), active_text, font=font, fill=text_color)
         
         img.save(f"{frames_dir}/{frame_file}")
     
@@ -291,16 +372,25 @@ def edit_video():
     current = Path(path)
     if remove_sil:
         ok = remove_silences(current, temp)
-        if ok and temp.exists():
+        if ok and temp.exists() and get_duration(temp) < get_duration(current):
             current = temp
+            # Recalculate original duration based on trimmed audio
+            original_dur = get_duration(current)
     
     # Step 2: Burn captions
     out = EXPORTS / ("export_" + str(int(time.time())) + ".mp4")
     if auto_caps:
-        ok = burn_captions(current, out, style)
+        try:
+            segments, full_text = transcribe_video(current)
+            ok = burn_captions_from_whisper(current, out, segments, style)
+            if not ok:
+                # Fallback: just copy (use -shortest to respect trimmed audio)
+                subprocess.run(["ffmpeg","-y","-i",str(current),"-c","copy","-shortest",str(out)], capture_output=True, timeout=30)
+        except Exception as e:
+            print(f"Whisper/caption error: {e}")
+            subprocess.run(["ffmpeg","-y","-i",str(current),"-c","copy","-shortest",str(out)], capture_output=True, timeout=30)
     else:
-        # Just copy
-        subprocess.run(["ffmpeg","-y","-i",str(current),"-c","copy",str(out)], capture_output=True, timeout=30)
+        subprocess.run(["ffmpeg","-y","-i",str(current),"-c","copy","-shortest",str(out)], capture_output=True, timeout=30)
     
     if not out.exists():
         return _err("export failed")
