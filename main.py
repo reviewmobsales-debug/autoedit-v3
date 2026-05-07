@@ -478,3 +478,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.server:
         app.run(host=args.host, port=args.port, threaded=True, debug=False)
+
+# Transcript cache
+_TRANSCRIPT_CACHE = {}

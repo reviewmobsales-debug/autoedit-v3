@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: autoedit-v3
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py --server --host 0.0.0.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.9"
