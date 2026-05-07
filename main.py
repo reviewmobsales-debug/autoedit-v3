@@ -16,6 +16,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from face_crop import auto_crop_vertical
 
 app = Flask(__name__, static_folder=None)
 BASE = Path(__file__).parent.resolve()
@@ -330,6 +331,28 @@ def get_progress_route(job_id):
     if prog:
         return _ok(prog)
     return _err("job not found")
+
+
+@app.route("/api/crop-to-vertical", methods=["POST"])
+def crop_vertical():
+    """Auto-crop video to vertical TikTok format (9:16) with face detection."""
+    data = request.get_json(force=True) or {}
+    path = data.get("path", "")
+    if not path or not os.path.exists(path):
+        return _err("file not found")
+    
+    out = EXPORTS / ("vertical_" + str(int(time.time())) + ".mp4")
+    ok = auto_crop_vertical(path, out)
+    
+    if ok and out.exists():
+        dur = get_duration(out)
+        return _ok({
+            "output": str(out),
+            "duration": round(dur, 2),
+            "message": "Auto-cropped to vertical 9:16 with face detection"
+        })
+    return _err("face crop failed")
+
 
 def transcribe_video(video_path, model="base"):
     """Real Whisper transcription with word-level timing."""
