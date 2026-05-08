@@ -160,13 +160,44 @@ def _render_cinematic(draw, img, w, h, text, font):
     draw.text((x,y), t, font=font, fill=(255,230,150))
 
 def _render_clean(draw, img, w, h, text, font):
-    y = int(h * 0.84)
-    bbox = draw.textbbox((0,0), text, font=font)
-    tw = bbox[2]-bbox[0]
+    """Clean style: white text with semi-transparent pill background."""
+    target_y = int(h * 0.82)
+    max_w = int(w * 0.88)
+    pad_x, pad_y = 32, 16
+    
+    # Ensure text fits
+    font_path = "/System/Library/Fonts/Helvetica.ttc"
+    test_font = font
+    bbox = draw.textbbox((0,0), text, font=test_font)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    
+    if tw > max_w and hasattr(test_font, 'size'):
+        ratio = max_w / tw
+        new_size = max(int(test_font.size * ratio * 0.92), 32)
+        test_font = ImageFont.truetype(font_path, new_size)
+        bbox = draw.textbbox((0,0), text, font=test_font)
+        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    
     x = (w - tw) // 2
-    for dx,dy in [(-2,-2),(-2,2),(2,-2),(2,2)]:
-        draw.text((x+dx,y+dy), text, font=font, fill=(0,0,0,120))
-    draw.text((x,y), text, font=font, fill=(255,255,255))
+    y = target_y
+    
+    # Clamp
+    if x - pad_x < 0: x = pad_x
+    if x + tw + pad_x > w: x = w - tw - pad_x
+    if y + th + pad_y > h: y = h - th - pad_y
+    if y - pad_y < 0: y = pad_y
+    
+    # Semi-transparent pill (more visible than just text)
+    draw.rounded_rectangle(
+        [x-pad_x, y-pad_y, x+tw+pad_x, y+th+pad_y],
+        radius=20, fill=(0, 0, 0, 140)
+    )
+    
+    # White text with subtle outline
+    for dx,dy in [(-3,0),(3,0),(0,-3),(0,3)]:
+        draw.text((x+dx,y+dy), text, font=test_font, fill=(0,0,0,200))
+    draw.text((x,y), text, font=test_font, fill=(255,255,255))
+
 
 def burn_captions_from_whisper(input_path, output_path, segments, style="tiktok"):
     """Burn captions using PIL (frame-by-frame extraction + reconstruction)."""
