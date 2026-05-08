@@ -7,7 +7,7 @@ def render_caption_style(draw, img, w, h, active_text, style):
     # Scale fonts for 1080x1920: h=1920, so h//22=87pt, h//28=68pt, h//36=53pt
     font_large = ImageFont.truetype(font_path, min(h // 18, 96))
     font_medium = ImageFont.truetype(font_path, min(h // 22, 72))
-    font_small = ImageFont.truetype(font_path, min(h // 28, 56))
+    font_small = ImageFont.truetype(font_path, min(h // 24, 64))
     
     if style == "tiktok":
         _render_tiktok(draw, img, w, h, active_text, font_large)
@@ -94,7 +94,7 @@ def _render_tiktok(draw, img, w, h, text, font):
     gy = y
     for line in lines:
         gx = x if not multi_line else (w - draw.textbbox((0,0), line, font=test_font)[2] + draw.textbbox((0,0), line, font=test_font)[0]) // 2
-        for r in range(25, 2, -3):
+        for r in range(35, 2, -4):
             a = int(30 * r/25)
             g.text((gx, gy), line, font=test_font, fill=(255,50,150,a))
         gy += int(test_font.size * 1.2)

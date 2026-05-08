@@ -24,6 +24,10 @@ from editor.transcription import transcribe_video
 from burn_overlay import burn_text_overlay
 
 
+
+# Ensure clean port
+subprocess.run(["pkill", "-9", "-f", "python3 main.py"], capture_output=True)
+subprocess.run(["lsof", "-ti:5002"], capture_output=True)
 app = Flask(__name__, static_folder=None)
 BASE = Path(__file__).parent.resolve()
 UPLOADS = BASE / "uploads"
