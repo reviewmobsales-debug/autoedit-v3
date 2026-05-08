@@ -4,9 +4,10 @@ import subprocess, os, tempfile, shutil
 
 def render_caption_style(draw, img, w, h, active_text, style):
     font_path = "/System/Library/Fonts/Helvetica.ttc"
-    font_large = ImageFont.truetype(font_path, min(h // 14, 80))
-    font_medium = ImageFont.truetype(font_path, min(h // 18, 56))
-    font_small = ImageFont.truetype(font_path, min(h // 22, 40))
+    # Scale fonts for 1080x1920: h=1920, so h//22=87pt, h//28=68pt, h//36=53pt
+    font_large = ImageFont.truetype(font_path, min(h // 18, 96))
+    font_medium = ImageFont.truetype(font_path, min(h // 22, 72))
+    font_small = ImageFont.truetype(font_path, min(h // 28, 56))
     
     if style == "tiktok":
         _render_tiktok(draw, img, w, h, active_text, font_large)
@@ -20,24 +21,102 @@ def render_caption_style(draw, img, w, h, active_text, style):
         _render_clean(draw, img, w, h, active_text, font_medium)
 
 def _render_tiktok(draw, img, w, h, text, font):
-    y = int(h * 0.76)
-    bbox = draw.textbbox((0,0), text, font=font)
-    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
-    x = (w - tw) // 2
+    """TikTok-style caption: lower-third, bold, with glow and pill.
+    Dynamically scales font to fit frame width."""
     
+    max_w = int(w * 0.9)  # 90% of frame width
+    pad_x, pad_y = 40, 20
+    target_y = int(h * 0.82)
+    
+    # Try to fit text; reduce font if too wide
+    test_font = font
+    bbox = draw.textbbox((0,0), text, font=test_font)
+    tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    
+    if tw > max_w:
+        # Reduce font size proportionally
+        ratio = max_w / tw
+        new_size = int(test_font.size * ratio * 0.9)  # 0.9 for safety margin
+        new_size = max(new_size, 28)  # minimum 28pt
+        font_path = "/System/Library/Fonts/Helvetica.ttc"
+        test_font = ImageFont.truetype(font_path, new_size)
+        bbox = draw.textbbox((0,0), text, font=test_font)
+        tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    
+    # Still too wide? Wrap to multiple lines
+    if tw > max_w:
+        words = text.split()
+        lines = []
+        current = ""
+        for word in words:
+            trial = current + " " + word if current else word
+            tb = draw.textbbox((0,0), trial, font=test_font)
+            if tb[2]-tb[0] <= max_w:
+                current = trial
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        
+        # If single word too long, force split
+        if not lines:
+            lines = [text[:20], text[20:]] if len(text) > 20 else [text]
+        
+        # Recalculate dimensions
+        line_heights = []
+        line_widths = []
+        for line in lines:
+            lb = draw.textbbox((0,0), line, font=test_font)
+            line_widths.append(lb[2]-lb[0])
+            line_heights.append(lb[3]-lb[1])
+        
+        tw = max(line_widths)
+        th = sum(line_heights) + (len(lines)-1) * int(test_font.size * 0.3)
+        multi_line = True
+    else:
+        lines = [text]
+        multi_line = False
+    
+    x = (w - tw) // 2
+    y = target_y
+    
+    # Clamp to bounds
+    if x - pad_x < 0: x = pad_x
+    if x + tw + pad_x > w: x = w - tw - pad_x
+    if y + th + pad_y > h: y = h - th - pad_y
+    if y - pad_y < 0: y = pad_y
+    
+    # Glow effect
     glow = Image.new("RGBA", (w,h), (0,0,0,0))
     g = ImageDraw.Draw(glow)
-    for r in range(20,4,-4):
-        a = int(40 * r/20)
-        g.text((x,y), text, font=font, fill=(255,50,150,a))
-    glow = glow.filter(ImageFilter.GaussianBlur(radius=6))
+    gy = y
+    for line in lines:
+        gx = x if not multi_line else (w - draw.textbbox((0,0), line, font=test_font)[2] + draw.textbbox((0,0), line, font=test_font)[0]) // 2
+        for r in range(25, 2, -3):
+            a = int(30 * r/25)
+            g.text((gx, gy), line, font=test_font, fill=(255,50,150,a))
+        gy += int(test_font.size * 1.2)
+    
+    glow = glow.filter(ImageFilter.GaussianBlur(radius=8))
     img.paste(Image.alpha_composite(img.convert("RGBA"), glow).convert("RGB"), (0,0))
     draw = ImageDraw.Draw(img, "RGBA")
     
-    draw.rounded_rectangle([x-36,y-20,x+tw+36,y+th+20], radius=24, fill=(0,0,0,160))
-    for dx,dy in [(-6,0),(6,0),(0,-6),(0,6)]:
-        draw.text((x+dx,y+dy), text, font=font, fill=(0,0,0,220))
-    draw.text((x,y), text, font=font, fill=(255,255,255))
+    # Pill background
+    draw.rounded_rectangle(
+        [x-pad_x, y-pad_y, x+tw+pad_x, y+th+pad_y], 
+        radius=24, fill=(0,0,0,170)
+    )
+    
+    # Render each line with outline
+    ry = y
+    for line in lines:
+        lx = x if not multi_line else (w - draw.textbbox((0,0), line, font=test_font)[2] + draw.textbbox((0,0), line, font=test_font)[0]) // 2
+        for dx,dy in [(-3,0),(3,0),(0,-3),(0,3),(-2,-2),(2,2),(-2,2),(2,-2)]:
+            draw.text((lx+dx, ry+dy), line, font=test_font, fill=(0,0,0,230))
+        draw.text((lx, ry), line, font=test_font, fill=(255,255,255))
+        ry += int(test_font.size * 1.15)
 
 def _render_youtube(draw, img, w, h, text, font):
     y = int(h * 0.89)
